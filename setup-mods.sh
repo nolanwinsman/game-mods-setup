@@ -1,78 +1,98 @@
 #!/usr/bin/env bash
-# setup-mods.sh — entrypoint for installing Windows-exe-based game mods on NixOS
-# under Wine/Proton, without touching the Steam Proton prefix directly.
-#
-# Usage:
-#   ./setup-mods.sh              walk through every registered mod, asking Y/n for each
-#   ./setup-mods.sh <mod-name>   run just that one mod, no prompt
-#   ./setup-mods.sh list         list registered mods
-#
-# Add new mods by dropping a mods/<name>.sh file that defines install_<name>(),
-# then adding <name> to the MODS array and the case in run_mod() below.
-
+# setup-mods.sh — discovers every mod script in scripts/ and asks whether to
+# install each one. Each script in scripts/ is expected to:
+#   1. Be named after its mod, e.g. scripts/vtmbunofficialpatch.sh
+#   2. Have a "# DESC: <one-line description>" comment near the top, which
+#      is shown to the user instead of the bare filename.
+#   3. Define an install_<name> function matching the filename (minus .sh),
+#      e.g. scripts/vtmbunofficialpatch.sh -> install_vtmbunofficialpatch
+#   4. Handle its own prompts (exe path, game dir fallback, etc.) internally.
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")"
 
-source ./lib/steam.sh
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+MODS_DIR="$SCRIPT_DIR/scripts"
+LIB_DIR="$SCRIPT_DIR/lib"
 
-# Registry of available mods. Order here is the order they're offered in.
-MODS=(re4hdproject)
+# Source shared helpers (find_game_dir, ensure_wine, run_installer_in_prefix, etc.)
+if [[ -f "$LIB_DIR/steam.sh" ]]; then
+	# shellcheck source=lib/steam.sh
+	source "$LIB_DIR/steam.sh"
+else
+	echo "ERROR: expected $LIB_DIR/steam.sh but it wasn't found." >&2
+	exit 1
+fi
 
-usage() {
-    cat <<EOF
-Usage: $0                run through every mod below and ask whether to set it up
-       $0 <mod-name>     set up just one mod, skipping the prompt
-       $0 list           list available mods
+if [[ ! -d "$MODS_DIR" ]]; then
+	echo "ERROR: mods directory '$MODS_DIR' not found." >&2
+	exit 1
+fi
 
-Available mods:
-  re4hdproject   Install RE4 HD Project for Resident Evil 4 (2005)
-                 (will prompt you for the path to re4HDProject-setup.exe)
-EOF
-}
-
-# run_mod <name> — dispatches to that mod's install function.
-run_mod() {
-    local mod="$1"
-    case "$mod" in
-        re4hdproject)
-            source ./mods/re4hdproject.sh
-            install_re4hdproject
-            ;;
-        *)
-            echo "Unknown mod: $mod" >&2
-            return 1
-            ;;
-    esac
-}
-
-# ask_yes_no <prompt> — returns 0 for yes, 1 for no/anything else. Defaults to no.
 ask_yes_no() {
-    local prompt="$1" ans
-    read -rp "$prompt [y/N] " ans
-    [[ "$ans" =~ ^[Yy]$ ]]
+	local prompt="$1" reply
+	while true; do
+		read -rp "$prompt [y/N] " reply
+		case "$reply" in
+		[Yy] | [Yy][Ee][Ss]) return 0 ;;
+		"" | [Nn] | [Nn][Oo]) return 1 ;;
+		*) echo "Please answer y or n." ;;
+		esac
+	done
 }
 
-if [[ "${1:-}" == "list" ]]; then
-    usage
-    exit 0
+# Extracts the "# DESC: ..." comment from a script, if present.
+# Only looks at the first 20 lines so it doesn't accidentally pick up a
+# DESC-looking string buried in a heredoc later in the file.
+get_desc() {
+	local script="$1" line
+	line="$(head -n 20 "$script" | grep -m1 -E '^#[[:space:]]*DESC:[[:space:]]*' || true)"
+	if [[ -n "$line" ]]; then
+		sed -E 's/^#[[:space:]]*DESC:[[:space:]]*//' <<<"$line"
+	fi
+}
+
+shopt -s nullglob
+mod_scripts=("$MODS_DIR"/*.sh)
+shopt -u nullglob
+
+if [[ ${#mod_scripts[@]} -eq 0 ]]; then
+	echo "No mod scripts found in $MODS_DIR."
+	exit 0
 fi
 
-if [[ $# -ge 1 ]]; then
-    # A specific mod was named — just run it, no prompting.
-    run_mod "$1"
-    exit $?
-fi
-
-# No mod named: walk the whole registry and ask for each one.
-echo "No mod specified — going through all available mods."
+echo "Found ${#mod_scripts[@]} mod script(s) in $MODS_DIR."
 echo
-for mod in "${MODS[@]}"; do
-    if ask_yes_no "Set up '$mod'?"; then
-        echo "==> Setting up $mod"
-        run_mod "$mod" || echo "!! $mod setup failed or was cancelled." >&2
-    else
-        echo "==> Skipping $mod"
-    fi
-    echo
+
+for script in "${mod_scripts[@]}"; do
+	name="$(basename "$script" .sh)"
+	func="install_${name}"
+	desc="$(get_desc "$script")"
+
+	# shellcheck source=/dev/null
+	source "$script"
+
+	if ! declare -F "$func" >/dev/null; then
+		echo "!! Skipping '$name': expected function '$func' not found in $script." >&2
+		echo
+		continue
+	fi
+
+	if [[ -n "$desc" ]]; then
+		echo "== ${name} =="
+		echo "   $desc"
+	else
+		echo "== ${name} (no description found) =="
+	fi
+
+	if ask_yes_no "Install this mod?"; then
+		if "$func"; then
+			echo "==> ${name}: done."
+		else
+			echo "!! ${name}: install failed (exit code $?)." >&2
+		fi
+	else
+		echo "==> Skipping ${name}."
+	fi
+	echo
 done
-echo "Done."
+
+echo "All done."
